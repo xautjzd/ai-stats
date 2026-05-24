@@ -1,0 +1,1083 @@
+#!/usr/bin/env bash
+#
+# AI Coding Tools Usage Statistics
+# Supports: Claude Code, OpenCode, Codex CLI
+# Extensible architecture for adding new tools
+#
+# Compatible with Bash 3.x+ (macOS default)
+#
+
+set -e
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Terminal dimensions for responsive design
+TERM_WIDTH=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+TERM_HEIGHT=${LINES:-$(tput lines 2>/dev/null || echo 24)}
+
+# Colors and formatting
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+ITALIC='\033[3m'
+UNDERLINE='\033[4m'
+
+# Theme colors — semantic roles, not decorative
+PRIMARY='\033[38;5;68m'      # Steel blue — structural chrome, borders
+SECONDARY='\033[38;5;147m'   # Soft purple — section / subsection labels
+SUCCESS='\033[38;5;78m'      # Sage green — cache hits, efficiency
+WARNING='\033[38;5;208m'     # Amber — caution
+DANGER='\033[38;5;167m'      # Dusty rose — cost figures
+INFO='\033[38;5;74m'         # Cornflower — token counts
+MUTED='\033[38;5;240m'       # Charcoal — de-emphasized labels
+HIGHLIGHT='\033[38;5;229m'   # Pale gold — totals & key figures
+
+# Per-tool brand colors — intentionally distinct from semantic palette
+COLOR_CLAUDE='\033[38;5;135m'    # Orchid    — Claude / Anthropic
+COLOR_OPENCODE='\033[38;5;44m'   # Turquoise — OpenCode
+COLOR_CODEX='\033[38;5;221m'     # Gold      — Codex CLI
+
+# Tool registry (using regular arrays instead of associative)
+TOOL_NAMES=("claude" "opencode" "codex")
+TOOL_DISPLAYS=("Claude Code" "OpenCode" "Codex CLI")
+TOOL_PATHS=("~/.claude/stats-cache.json" "~/.local/share/opencode/opencode.db" "~/.codex/state_5.sqlite")
+TOOL_TYPES=("json" "sqlite" "sqlite")
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+# Print colored text (no newline)
+printc() {
+    local color="$1"
+    local text="$2"
+    printf "${color}%s${RESET}" "$text"
+}
+
+# Print colored text with newline
+printcln() {
+    local color="$1"
+    local text="$2"
+    printf "${color}%s${RESET}\n" "$text"
+}
+
+# Print horizontal line
+hr() {
+    local char="${1:-─}"
+    local width=${2:-$TERM_WIDTH}
+    printf '%*s\n' "$width" '' | tr ' ' "$char"
+}
+
+# Print section header
+section() {
+    local title="$1"
+    local width=${2:-$TERM_WIDTH}
+    printf "\n"
+    printf "${PRIMARY}%s${RESET}\n" "$(hr '─' "$width")"
+    printf "${SECONDARY}${BOLD}  ▪ %s${RESET}\n" "$title"
+    printf "${PRIMARY}%s${RESET}\n" "$(hr '─' "$width")"
+}
+
+# Print full-width tool banner with distinct color
+# Usage: tool_banner "TOOL NAME" "icon" "$COLOR"
+tool_banner() {
+    local title="$1"
+    local icon="$2"
+    local color="$3"
+    local width=${TERM_WIDTH:-80}
+    printf "\n"
+    printf "${color}%s${RESET}\n" "$(hr '━' "$width")"
+    printf "${color}${BOLD}  %s  %s${RESET}\n" "$icon" "$title"
+    printf "${color}%s${RESET}\n" "$(hr '━' "$width")"
+    printf "\n"
+}
+
+# Print full-width separator between tool sections
+tool_separator() {
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "$(hr '╌')"
+    printf "\n"
+}
+
+# Print subsection header
+subsection() {
+    printf "\n${SECONDARY}  ┌─ %s${RESET}\n" "$1"
+}
+
+# Render a fixed-width ASCII progress bar
+progress_bar() {
+    local value="$1"
+    local max="$2"
+    local width="${3:-20}"
+    local color="${4:-$PRIMARY}"
+    if [[ -z "$max" || "$max" -eq 0 ]]; then
+        printf "${MUTED}%s${RESET}" "$(printf '%*s' "$width" '' | tr ' ' '░')"
+        return
+    fi
+    local filled=$(( value * width / max ))
+    [[ $filled -gt $width ]] && filled=$width
+    local empty=$(( width - filled ))
+    [[ $filled -gt 0 ]] && printf "${color}%s${RESET}" "$(printf '%*s' "$filled" '' | tr ' ' '█')"
+    [[ $empty -gt 0 ]] && printf "${MUTED}%s${RESET}" "$(printf '%*s' "$empty" '' | tr ' ' '░')"
+}
+
+# Format large numbers with commas
+fmt_num() {
+    local num="$1"
+    if [[ "$num" == "null" || -z "$num" ]]; then
+        echo "0"
+    elif command -v numfmt &>/dev/null; then
+        echo "$num" | numfmt --grouping 2>/dev/null || echo "$num"
+    else
+        # Manual comma insertion for systems without numfmt
+        printf "%'d\n" "$num" 2>/dev/null || echo "$num"
+    fi
+}
+
+# Format bytes to human readable
+fmt_bytes() {
+    local bytes="$1"
+    if [[ -z "$bytes" || "$bytes" == "0" ]]; then
+        echo "0 B"
+    elif command -v numfmt &>/dev/null; then
+        numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || echo "$bytes B"
+    else
+        if (( bytes > 1073741824 )); then
+            printf "%.2f GB" "$((bytes / 1073741824)).$((bytes % 1073741824 / 10000000))"
+        elif (( bytes > 1048576 )); then
+            printf "%.2f MB" "$((bytes / 1048576)).$((bytes % 1048576 / 10000))"
+        elif (( bytes > 1024 )); then
+            printf "%.2f KB" "$((bytes / 1024)).$((bytes % 1024 / 10))"
+        else
+            echo "$bytes B"
+        fi
+    fi
+}
+
+# Format milliseconds to duration
+fmt_duration() {
+    local ms="$1"
+    if [[ -z "$ms" || "$ms" == "0" ]]; then
+        echo "0s"
+        return
+    fi
+
+    local seconds=$((ms / 1000))
+    local minutes=$((seconds / 60))
+    local hours=$((minutes / 60))
+    local days=$((hours / 24))
+
+    if (( days > 0 )); then
+        printf "%dd %dh %dm" "$days" $((hours % 24)) $((minutes % 60))
+    elif (( hours > 0 )); then
+        printf "%dh %dm %ds" "$hours" $((minutes % 60)) $((seconds % 60))
+    elif (( minutes > 0 )); then
+        printf "%dm %ds" "$minutes" $((seconds % 60))
+    else
+        printf "%ds" "$seconds"
+    fi
+}
+
+# Expand tilde in paths
+expand_path() {
+    local path="$1"
+    if [[ "${path:0:1}" == "~" ]]; then
+        echo "$HOME${path:1}"
+    else
+        echo "$path"
+    fi
+}
+
+# Check if tool data exists
+tool_exists() {
+    local path="$1"
+    local full_path
+    full_path=$(expand_path "$path")
+    [[ -f "$full_path" ]]
+}
+
+# =============================================================================
+# CLAUDE CODE STATISTICS
+# =============================================================================
+
+claude_stats() {
+    local path
+    path=$(expand_path "~/.claude/stats-cache.json")
+
+    if [[ ! -f "$path" ]]; then
+        printf "  "
+        printf "${MUTED}%s${RESET}\n" "No data found"
+        return 1
+    fi
+
+    local data
+    data=$(cat "$path")
+
+    # Extract key metrics
+    local total_sessions total_messages
+    total_sessions=$(echo "$data" | jq -r '.totalSessions // 0' 2>/dev/null || echo "0")
+    total_messages=$(echo "$data" | jq -r '.totalMessages // 0' 2>/dev/null || echo "0")
+
+    # Calculate total tokens from modelUsage
+    local total_input total_output total_cache_read total_cache_write
+    total_input=$(echo "$data" | jq -r '[.modelUsage[]?.inputTokens // 0] | add' 2>/dev/null || echo "0")
+    total_output=$(echo "$data" | jq -r '[.modelUsage[]?.outputTokens // 0] | add' 2>/dev/null || echo "0")
+    total_cache_read=$(echo "$data" | jq -r '[.modelUsage[]?.cacheReadInputTokens // 0] | add' 2>/dev/null || echo "0")
+    total_cache_write=$(echo "$data" | jq -r '[.modelUsage[]?.cacheCreationInputTokens // 0] | add' 2>/dev/null || echo "0")
+
+    local total_tokens=$((total_input + total_output))
+
+    # Output statistics
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Sessions:")"
+    printf " %s\n" "$(printc "$BOLD" "$(fmt_num "$total_sessions")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Messages:")"
+    printf " %s\n" "$(printc "$BOLD" "$(fmt_num "$total_messages")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Input Tokens:")"
+    printf " %s\n" "$(printc "$INFO" "$(fmt_num "$total_input")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Output Tokens:")"
+    printf " %s\n" "$(printc "$INFO" "$(fmt_num "$total_output")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Cache Read:")"
+    printf " %s\n" "$(printc "$SUCCESS" "$(fmt_num "$total_cache_read")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Cache Write:")"
+    printf " %s\n" "$(printc "$SUCCESS" "$(fmt_num "$total_cache_write")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Total Tokens:")"
+    printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$(fmt_num "$total_tokens")")"
+
+    # Model breakdown
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Model Breakdown ─────────────────────────────────"
+    printf "  ${MUTED}%-30s %15s${RESET}\n" "Model" "Tokens"
+    echo "$data" | jq -r '.modelUsage | to_entries | sort_by(.value.inputTokens + .value.outputTokens) | reverse | .[] |
+        "\(.key)\t\(.value.inputTokens + .value.outputTokens)"' 2>/dev/null | while IFS=$'\t' read -r model tokens; do
+        printf "  ${INFO}%-30s${RESET} ${HIGHLIGHT}%15s${RESET} ${MUTED}tokens${RESET}\n" "$model" "$(fmt_num "$tokens")"
+    done
+
+    return 0
+}
+
+# MCP servers and skills stats for Claude Code
+claude_extensions() {
+    # MCP servers from desktop config
+    local mcp_config="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+    local mcp_count=0
+
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── MCP Servers ─────────────────────────────────────"
+
+    if [[ -f "$mcp_config" ]] && command -v jq &>/dev/null; then
+        mcp_count=$(jq -r '.mcpServers | length' "$mcp_config" 2>/dev/null || echo "0")
+        printf "  "
+        printf "%-20s" "$(printc "$MUTED" "Configured:")"
+        printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$mcp_count")"
+        jq -r '.mcpServers | keys | .[]' "$mcp_config" 2>/dev/null | while read -r name; do
+            printf "  ${MUTED}  •${RESET} ${INFO}%s${RESET}\n" "$name"
+        done
+    else
+        printf "  ${MUTED}%s${RESET}\n" "No MCP config found"
+    fi
+
+    # Skills from installed plugins
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Skills ──────────────────────────────────────────"
+
+    local plugins_file="$HOME/.claude/plugins/installed_plugins.json"
+    local total_skills=0
+
+    if [[ -f "$plugins_file" ]] && command -v jq &>/dev/null; then
+        # Collect unique install paths
+        local install_paths
+        install_paths=$(jq -r '.plugins | to_entries[] | .value[] | .installPath' "$plugins_file" 2>/dev/null | sort -u)
+
+        local plugin_names
+        plugin_names=$(jq -r '.plugins | keys | .[]' "$plugins_file" 2>/dev/null)
+
+        printf "  "
+        printf "%-20s" "$(printc "$MUTED" "Installed Plugins:")"
+        printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$(echo "$plugin_names" | wc -l | tr -d ' ')")"
+
+        while IFS= read -r install_path; do
+            [[ -z "$install_path" ]] && continue
+            local count=0
+            # Prefer skills/*/SKILL.md (modern system), fallback to .claude/commands/*.md
+            if [[ -d "$install_path/skills" ]]; then
+                count=$(find "$install_path/skills" -name "SKILL.md" | wc -l | tr -d ' ')
+            elif [[ -d "$install_path/.claude/commands" ]]; then
+                count=$(find "$install_path/.claude/commands" -name "*.md" | wc -l | tr -d ' ')
+            fi
+            [[ "$count" -eq 0 ]] && continue
+            total_skills=$((total_skills + count))
+            # Derive plugin display name from path
+            local plugin_name
+            plugin_name=$(echo "$install_path" | sed 's|.*/cache/[^/]*/||' | sed 's|/[^/]*$||')
+            printf "  ${MUTED}  •${RESET} ${INFO}%-30s${RESET} ${HIGHLIGHT}%3s${RESET} ${MUTED}skills${RESET}\n" "$plugin_name" "$count"
+        done <<< "$install_paths"
+
+        printf "  "
+        printf "%-20s" "$(printc "$MUTED" "Total Skills:")"
+        printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$total_skills")"
+    else
+        printf "  ${MUTED}%s${RESET}\n" "No plugin data found"
+    fi
+}
+
+# Daily activity for Claude Code
+claude_daily() {
+    local path
+    path=$(expand_path "~/.claude/stats-cache.json")
+
+    if [[ ! -f "$path" ]]; then
+        return 1
+    fi
+
+    local data
+    data=$(cat "$path")
+
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Recent 7 Days ───────────────────────────────────"
+    printf "  ${MUTED}%-12s %10s %10s %10s${RESET}\n" "Date" "Sessions" "Messages" "Tools"
+    echo "$data" | jq -r '.dailyActivity | sort_by(.date) | reverse | .[0:7] | .[] |
+        "\(.date)\t\(.sessionCount)\t\(.messageCount)\t\(.toolCallCount)"' 2>/dev/null | \
+    while IFS=$'\t' read -r date sessions messages tools; do
+        printf "  ${INFO}%-12s${RESET} ${BOLD}%10s${RESET} %10s ${SUCCESS}%10s${RESET}\n" \
+            "$date" "$sessions" "$messages" "$tools"
+    done
+}
+
+# =============================================================================
+# OPENCODE STATISTICS
+# =============================================================================
+
+opencode_stats() {
+    local db_path
+    db_path=$(expand_path "~/.local/share/opencode/opencode.db")
+
+    if [[ ! -f "$db_path" ]]; then
+        printf "  "
+        printf "${MUTED}%s${RESET}\n" "No data found"
+        return 1
+    fi
+
+    # Query session statistics
+    local total_sessions total_messages
+    total_sessions=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM session;" 2>/dev/null || echo "0")
+    total_messages=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM message;" 2>/dev/null || echo "0")
+
+    # Query token statistics
+    local total_input total_output total_reasoning total_cache_read total_cache_write total_cost
+    total_input=$(sqlite3 "$db_path" "SELECT COALESCE(SUM(tokens_input), 0) FROM session;" 2>/dev/null || echo "0")
+    total_output=$(sqlite3 "$db_path" "SELECT COALESCE(SUM(tokens_output), 0) FROM session;" 2>/dev/null || echo "0")
+    total_reasoning=$(sqlite3 "$db_path" "SELECT COALESCE(SUM(tokens_reasoning), 0) FROM session;" 2>/dev/null || echo "0")
+    total_cache_read=$(sqlite3 "$db_path" "SELECT COALESCE(SUM(tokens_cache_read), 0) FROM session;" 2>/dev/null || echo "0")
+    total_cache_write=$(sqlite3 "$db_path" "SELECT COALESCE(SUM(tokens_cache_write), 0) FROM session;" 2>/dev/null || echo "0")
+    total_cost=$(sqlite3 "$db_path" "SELECT COALESCE(SUM(cost), 0) FROM session;" 2>/dev/null || echo "0")
+
+    local total_tokens=$((total_input + total_output + total_reasoning))
+
+    # Output statistics
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Sessions:")"
+    printf " %s\n" "$(printc "$BOLD" "$(fmt_num "$total_sessions")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Messages:")"
+    printf " %s\n" "$(printc "$BOLD" "$(fmt_num "$total_messages")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Input Tokens:")"
+    printf " %s\n" "$(printc "$INFO" "$(fmt_num "$total_input")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Output Tokens:")"
+    printf " %s\n" "$(printc "$INFO" "$(fmt_num "$total_output")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Reasoning Tokens:")"
+    printf " %s\n" "$(printc "$WARNING" "$(fmt_num "$total_reasoning")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Cache Read:")"
+    printf " %s\n" "$(printc "$SUCCESS" "$(fmt_num "$total_cache_read")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Cache Write:")"
+    printf " %s\n" "$(printc "$SUCCESS" "$(fmt_num "$total_cache_write")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Total Tokens:")"
+    printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$(fmt_num "$total_tokens")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Est. Cost:")"
+    printf " %s\n" "$(printc "$DANGER" "\$$(printf "%.4f" "$total_cost")")"
+
+    # Model breakdown
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Model Breakdown ─────────────────────────────────"
+    printf "  ${MUTED}%-30s %8s %15s${RESET}\n" "Model" "Sessions" "Tokens"
+    sqlite3 "$db_path" "SELECT
+        COALESCE(json_extract(model, '$.id'), model, 'unknown') as model_name,
+        COUNT(*) as sessions,
+        SUM(tokens_input + tokens_output + tokens_reasoning) as total_tokens
+    FROM session
+    WHERE model IS NOT NULL
+    GROUP BY model
+    ORDER BY total_tokens DESC;" 2>/dev/null | while IFS='|' read -r model sessions tokens; do
+        printf "  ${INFO}%-30s${RESET} ${MUTED}%8s${RESET} ${HIGHLIGHT}%15s${RESET} ${MUTED}tokens${RESET}\n" \
+            "$model" "$sessions" "$(fmt_num "$tokens")"
+    done
+
+    return 0
+}
+
+# Daily activity for OpenCode
+opencode_daily() {
+    local db_path
+    db_path=$(expand_path "~/.local/share/opencode/opencode.db")
+
+    if [[ ! -f "$db_path" ]]; then
+        return 1
+    fi
+
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Recent 7 Days ───────────────────────────────────"
+    printf "  ${MUTED}%-12s %10s %15s %12s${RESET}\n" "Date" "Sessions" "Tokens" "Cost"
+    sqlite3 "$db_path" "SELECT
+        date(time_created/1000, 'unixepoch', 'localtime') as day,
+        COUNT(*) as sessions,
+        SUM(tokens_input + tokens_output + tokens_reasoning) as tokens,
+        SUM(cost) as cost
+    FROM session
+    WHERE time_created > (strftime('%s', 'now') - 7*24*60*60) * 1000
+    GROUP BY day
+    ORDER BY day DESC;" 2>/dev/null | while IFS='|' read -r day sessions tokens cost; do
+        printf "  ${INFO}%-12s${RESET} ${BOLD}%10s${RESET} %15s ${DANGER}%12s${RESET}\n" \
+            "$day" "$sessions" "$(fmt_num "$tokens")" "\$$(printf "%.4f" "${cost:-0}")"
+    done
+}
+
+# =============================================================================
+# CODEX CLI STATISTICS
+# =============================================================================
+
+codex_stats() {
+    local db_path
+    db_path=$(expand_path "~/.codex/state_5.sqlite")
+
+    if [[ ! -f "$db_path" ]]; then
+        printf "  "
+        printf "${MUTED}%s${RESET}\n" "No data found"
+        return 1
+    fi
+
+    # Query thread statistics
+    local total_threads active_threads archived_threads
+    total_threads=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM threads;" 2>/dev/null || echo "0")
+    active_threads=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM threads WHERE archived = 0;" 2>/dev/null || echo "0")
+    archived_threads=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM threads WHERE archived = 1;" 2>/dev/null || echo "0")
+
+    # Query token statistics
+    local total_tokens
+    total_tokens=$(sqlite3 "$db_path" "SELECT COALESCE(SUM(tokens_used), 0) FROM threads;" 2>/dev/null || echo "0")
+
+    # Query source and provider breakdown
+    local cli_count vscode_count
+    cli_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM threads WHERE source = 'cli';" 2>/dev/null || echo "0")
+    vscode_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM threads WHERE source = 'vscode';" 2>/dev/null || echo "0")
+
+    # Output statistics
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Total Threads:")"
+    printf " %s\n" "$(printc "$BOLD" "$(fmt_num "$total_threads")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Active Threads:")"
+    printf " %s\n" "$(printc "$SUCCESS" "$(fmt_num "$active_threads")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Archived Threads:")"
+    printf " %s\n" "$(printc "$MUTED" "$(fmt_num "$archived_threads")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Total Tokens Used:")"
+    printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$(fmt_num "$total_tokens")")"
+
+    # Source breakdown
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Source Breakdown ────────────────────────────────"
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "CLI:")"
+    printf " %s\n" "$(printc "$INFO" "$(fmt_num "$cli_count")")"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "VS Code:")"
+    printf " %s\n" "$(printc "$INFO" "$(fmt_num "$vscode_count")")"
+
+    # Model breakdown
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Model Breakdown ─────────────────────────────────"
+    printf "  ${MUTED}%-30s %8s %15s${RESET}\n" "Model" "Sessions" "Tokens"
+    sqlite3 "$db_path" "SELECT
+        COALESCE(model, 'unknown') as model_name,
+        COUNT(*) as sessions,
+        SUM(tokens_used) as total_tokens
+    FROM threads
+    WHERE model IS NOT NULL
+    GROUP BY model
+    ORDER BY total_tokens DESC;" 2>/dev/null | while IFS='|' read -r model sessions tokens; do
+        printf "  ${INFO}%-30s${RESET} ${MUTED}%8s${RESET} ${HIGHLIGHT}%15s${RESET} ${MUTED}tokens${RESET}\n" \
+            "$model" "$sessions" "$(fmt_num "$tokens")"
+    done
+
+    return 0
+}
+
+# Daily activity for Codex
+codex_daily() {
+    local db_path
+    db_path=$(expand_path "~/.codex/state_5.sqlite")
+
+    if [[ ! -f "$db_path" ]]; then
+        return 1
+    fi
+
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Recent 7 Days ───────────────────────────────────"
+    printf "  ${MUTED}%-12s %10s %15s${RESET}\n" "Date" "Threads" "Tokens"
+    sqlite3 "$db_path" "SELECT
+        date(created_at, 'unixepoch', 'localtime') as day,
+        COUNT(*) as threads,
+        SUM(tokens_used) as tokens
+    FROM threads
+    WHERE created_at > strftime('%s', 'now') - 7*24*60*60
+    GROUP BY day
+    ORDER BY day DESC;" 2>/dev/null | while IFS='|' read -r day threads tokens; do
+        printf "  ${INFO}%-12s${RESET} ${BOLD}%10s${RESET} %15s\n" \
+            "$day" "$threads" "$(fmt_num "$tokens")"
+    done
+}
+
+# =============================================================================
+# COMPREHENSIVE DASHBOARD
+# =============================================================================
+
+show_dashboard() {
+    clear 2>/dev/null || true
+
+    # Header
+    local now
+    now=$(date '+%Y-%m-%d %H:%M')
+    printf "\n"
+    printf "${PRIMARY}%s${RESET}\n" "$(hr '━')"
+    printf "${BOLD}${PRIMARY}%*s${RESET}\n" $(( (TERM_WIDTH + 26) / 2 )) "AI CODING TOOLS STATISTICS"
+    printf "${MUTED}%*s${RESET}\n" $(( (TERM_WIDTH + 14) / 2 )) "Generated $now"
+    printf "${PRIMARY}%s${RESET}\n" "$(hr '━')"
+    printf "\n"
+
+    # Summary cards
+    local claude_sessions=0 opencode_sessions=0 codex_sessions=0
+    local claude_tokens=0 opencode_tokens=0 codex_tokens=0
+    local has_data=false
+
+    # Collect data
+    if tool_exists "~/.claude/stats-cache.json"; then
+        local data
+        data=$(cat "$(expand_path "~/.claude/stats-cache.json")")
+        claude_sessions=$(echo "$data" | jq -r '.totalSessions // 0' 2>/dev/null || echo "0")
+        local claude_input claude_output
+        claude_input=$(echo "$data" | jq -r '[.modelUsage[]?.inputTokens // 0] | add' 2>/dev/null || echo "0")
+        claude_output=$(echo "$data" | jq -r '[.modelUsage[]?.outputTokens // 0] | add' 2>/dev/null || echo "0")
+        claude_tokens=$((claude_input + claude_output))
+        has_data=true
+    fi
+
+    if tool_exists "~/.local/share/opencode/opencode.db"; then
+        local db
+        db=$(expand_path "~/.local/share/opencode/opencode.db")
+        opencode_sessions=$(sqlite3 "$db" "SELECT COUNT(*) FROM session;" 2>/dev/null || echo "0")
+        opencode_tokens=$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_input + tokens_output + tokens_reasoning), 0) FROM session;" 2>/dev/null || echo "0")
+        has_data=true
+    fi
+
+    if tool_exists "~/.codex/state_5.sqlite"; then
+        local db
+        db=$(expand_path "~/.codex/state_5.sqlite")
+        codex_sessions=$(sqlite3 "$db" "SELECT COUNT(*) FROM threads;" 2>/dev/null || echo "0")
+        codex_tokens=$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_used), 0) FROM threads;" 2>/dev/null || echo "0")
+        has_data=true
+    fi
+
+    if [[ "$has_data" == false ]]; then
+        printc "$WARNING" "No data found for any supported tools."
+        return 1
+    fi
+
+    local total_sessions=$((claude_sessions + opencode_sessions + codex_sessions))
+    local total_tokens=$((claude_tokens + opencode_tokens + codex_tokens))
+
+    # Summary section
+    printf "${SECONDARY}${BOLD}%s${RESET}\n" "📊 OVERVIEW"
+    printf "\n"
+    printf "  ${MUTED}%-20s${RESET} " "Total Sessions:"
+    printf "${HIGHLIGHT}${BOLD}%s${RESET}\n" "$(fmt_num "$total_sessions")"
+    printf "  ${MUTED}%-20s${RESET} " "Total Tokens:"
+    printf "${HIGHLIGHT}${BOLD}%s${RESET}\n" "$(fmt_num "$total_tokens")"
+    printf "\n"
+
+    # Tool breakdown
+    printf "${SECONDARY}${BOLD}%s${RESET}\n" "🔧 TOOL BREAKDOWN"
+    printf "\n"
+    printf "  ${MUTED}%-15s %10s %20s  %-20s %5s${RESET}\n" "Tool" "Sessions" "Tokens" "" "Share"
+    printf "  ${MUTED}%s${RESET}\n" "$(hr '─' 74)"
+
+    local max_tokens=$(( total_tokens > 0 ? total_tokens : 1 ))
+
+    if [[ "$claude_sessions" -gt 0 ]]; then
+        local pct=$(( claude_tokens * 100 / max_tokens ))
+        printf "  ${COLOR_CLAUDE}${BOLD}◆ %-13s${RESET} %10s %20s  " "Claude Code" "$(fmt_num "$claude_sessions")" "$(fmt_num "$claude_tokens")"
+        progress_bar "$claude_tokens" "$total_tokens" 20 "$COLOR_CLAUDE"
+        printf " ${MUTED}%3d%%${RESET}\n" "$pct"
+    fi
+    if [[ "$opencode_sessions" -gt 0 ]]; then
+        local pct=$(( opencode_tokens * 100 / max_tokens ))
+        printf "  ${COLOR_OPENCODE}${BOLD}◈ %-13s${RESET} %10s %20s  " "OpenCode" "$(fmt_num "$opencode_sessions")" "$(fmt_num "$opencode_tokens")"
+        progress_bar "$opencode_tokens" "$total_tokens" 20 "$COLOR_OPENCODE"
+        printf " ${MUTED}%3d%%${RESET}\n" "$pct"
+    fi
+    if [[ "$codex_sessions" -gt 0 ]]; then
+        local pct=$(( codex_tokens * 100 / max_tokens ))
+        printf "  ${COLOR_CODEX}${BOLD}◇ %-13s${RESET} %10s %20s  " "Codex CLI" "$(fmt_num "$codex_sessions")" "$(fmt_num "$codex_tokens")"
+        progress_bar "$codex_tokens" "$total_tokens" 20 "$COLOR_CODEX"
+        printf " ${MUTED}%3d%%${RESET}\n" "$pct"
+    fi
+
+    printf "\n"
+    printf "${PRIMARY}%s${RESET}\n" "$(hr '━')"
+}
+
+# =============================================================================
+# DETAILED VIEWS
+# =============================================================================
+
+show_claude() {
+    tool_banner "CLAUDE CODE" "◆" "$COLOR_CLAUDE"
+    if ! tool_exists "~/.claude/stats-cache.json"; then
+        printf "${WARNING}%s${RESET}\n" "Claude Code data not found at ~/.claude/stats-cache.json"
+        tool_separator
+        return 1
+    fi
+    claude_stats
+    claude_daily
+    claude_extensions
+    tool_separator
+}
+
+opencode_extensions() {
+    local config="$HOME/.config/opencode/opencode.json"
+
+    # MCP Servers
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── MCP Servers ─────────────────────────────────────"
+
+    if [[ -f "$config" ]] && command -v jq &>/dev/null; then
+        local mcp_count
+        mcp_count=$(jq -r 'if .mcp then (.mcp | length) else 0 end' "$config" 2>/dev/null || echo "0")
+        printf "  "
+        printf "%-20s" "$(printc "$MUTED" "Configured:")"
+        printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$mcp_count")"
+        jq -r 'if .mcp then (.mcp | keys | .[]) else empty end' "$config" 2>/dev/null | while read -r name; do
+            printf "  ${MUTED}  •${RESET} ${INFO}%s${RESET}\n" "$name"
+        done
+    else
+        printf "  ${MUTED}%s${RESET}\n" "No config found at ~/.config/opencode/opencode.json"
+    fi
+
+    # Skills (paths + urls configured in opencode.json)
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Skills ──────────────────────────────────────────"
+
+    if [[ -f "$config" ]] && command -v jq &>/dev/null; then
+        local path_count url_count
+        path_count=$(jq -r '(.skills.paths // []) | length' "$config" 2>/dev/null || echo "0")
+        url_count=$(jq -r '(.skills.urls // []) | length' "$config" 2>/dev/null || echo "0")
+        local total_skills=$(( path_count + url_count ))
+        printf "  "
+        printf "%-20s" "$(printc "$MUTED" "Installed:")"
+        printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$total_skills")"
+        if [[ "$path_count" -gt 0 ]]; then
+            jq -r '(.skills.paths // []) | .[]' "$config" 2>/dev/null | while read -r p; do
+                printf "  ${MUTED}  •${RESET} ${INFO}%s${RESET}\n" "$p"
+            done
+        fi
+        if [[ "$url_count" -gt 0 ]]; then
+            jq -r '(.skills.urls // []) | .[]' "$config" 2>/dev/null | while read -r u; do
+                printf "  ${MUTED}  •${RESET} ${INFO}%s${RESET}\n" "$u"
+            done
+        fi
+    else
+        printf "  ${MUTED}%s${RESET}\n" "No config found at ~/.config/opencode/opencode.json"
+    fi
+}
+
+codex_extensions() {
+    local config="$HOME/.codex/config.toml"
+    local plugins_dir="$HOME/.codex/.tmp/plugins/plugins"
+
+    # Skills (enabled plugins)
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── Skills ──────────────────────────────────────────"
+
+    if [[ -f "$config" ]]; then
+        local enabled_plugins
+        enabled_plugins=$(awk '/^\[plugins\./ { gsub(/^\[plugins\."/, ""); gsub(/"\].*/, ""); plugin=$0 } /^enabled = true/ { print plugin }' "$config" 2>/dev/null)
+        local plugin_count
+        plugin_count=$(echo "$enabled_plugins" | grep -c . 2>/dev/null || echo "0")
+
+        printf "  "
+        printf "%-20s" "$(printc "$MUTED" "Enabled:")"
+        printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$plugin_count")"
+        echo "$enabled_plugins" | grep . | while read -r plugin; do
+            printf "  ${MUTED}  •${RESET} ${INFO}%s${RESET}\n" "$plugin"
+        done
+    else
+        printf "  ${MUTED}%s${RESET}\n" "No config found at ~/.codex/config.toml"
+        return
+    fi
+
+    # MCP Servers (from enabled plugins' .mcp.json)
+    printf "\n"
+    printf "${MUTED}%s${RESET}\n" "  ── MCP Servers ─────────────────────────────────────"
+
+    if [[ ! -d "$plugins_dir" ]]; then
+        printf "  ${MUTED}%s${RESET}\n" "No plugins directory found"
+        return
+    fi
+
+    local enabled_plugins
+    enabled_plugins=$(awk '/^\[plugins\./ { gsub(/^\[plugins\."/, ""); gsub(/"\].*/, ""); plugin=$0 } /^enabled = true/ { print plugin }' "$config" 2>/dev/null)
+
+    echo "$enabled_plugins" | grep . | while read -r plugin_id; do
+        local plugin_dir_name="${plugin_id%%@*}"
+        local mcp_file="$plugins_dir/$plugin_dir_name/.mcp.json"
+        [[ ! -f "$mcp_file" ]] && continue
+        local count
+        count=$(jq -r '.mcpServers | length' "$mcp_file" 2>/dev/null || echo "0")
+        [[ "$count" -eq 0 ]] && continue
+        printf "  ${MUTED}  •${RESET} ${INFO}%-30s${RESET} ${HIGHLIGHT}%3s${RESET} ${MUTED}server(s)${RESET}\n" "$plugin_dir_name" "$count"
+    done
+
+    local mcp_total=0
+    while IFS= read -r plugin_id; do
+        [[ -z "$plugin_id" ]] && continue
+        local plugin_dir_name="${plugin_id%%@*}"
+        local mcp_file="$plugins_dir/$plugin_dir_name/.mcp.json"
+        [[ ! -f "$mcp_file" ]] && continue
+        local c
+        c=$(jq -r '.mcpServers | length' "$mcp_file" 2>/dev/null || echo "0")
+        mcp_total=$((mcp_total + c))
+    done <<< "$enabled_plugins"
+
+    printf "  "
+    printf "%-20s" "$(printc "$MUTED" "Configured:")"
+    printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$mcp_total")"
+}
+
+show_opencode() {
+    tool_banner "OPENCODE" "◈" "$COLOR_OPENCODE"
+    if ! tool_exists "~/.local/share/opencode/opencode.db"; then
+        printf "${WARNING}%s${RESET}\n" "OpenCode data not found at ~/.local/share/opencode/opencode.db"
+        tool_separator
+        return 1
+    fi
+    opencode_stats
+    opencode_daily
+    opencode_extensions
+    tool_separator
+}
+
+show_codex() {
+    tool_banner "CODEX CLI" "◇" "$COLOR_CODEX"
+    if ! tool_exists "~/.codex/state_5.sqlite"; then
+        printf "${WARNING}%s${RESET}\n" "Codex CLI data not found at ~/.codex/state_5.sqlite"
+        tool_separator
+        return 1
+    fi
+    codex_stats
+    codex_daily
+    codex_extensions
+    tool_separator
+}
+
+# =============================================================================
+# COMPARISON VIEW
+# =============================================================================
+
+show_comparison() {
+    section "CROSS-TOOL COMPARISON"
+    printf "\n"
+
+    # Header
+    printf "  ${MUTED}%-15s %10s %15s %15s %12s${RESET}\n" "Tool" "Sessions" "Input Tokens" "Output Tokens" "Cache Hit"
+    printf "  ${MUTED}%s${RESET}\n" "$(hr '─' 71)"
+
+    # Claude Code
+    if tool_exists "~/.claude/stats-cache.json"; then
+        local data
+        data=$(cat "$(expand_path "~/.claude/stats-cache.json")")
+        local sessions input output cache
+        sessions=$(echo "$data" | jq -r '.totalSessions // 0' 2>/dev/null || echo "0")
+        input=$(echo "$data" | jq -r '[.modelUsage[]?.inputTokens // 0] | add' 2>/dev/null || echo "0")
+        output=$(echo "$data" | jq -r '[.modelUsage[]?.outputTokens // 0] | add' 2>/dev/null || echo "0")
+        cache=$(echo "$data" | jq -r '[.modelUsage[]?.cacheReadInputTokens // 0] | add' 2>/dev/null || echo "0")
+        printf "  ${COLOR_CLAUDE}${BOLD}◆ %-13s${RESET} %10s %15s %15s %12s\n" \
+            "Claude Code" \
+            "$(fmt_num "$sessions")" \
+            "$(fmt_num "$input")" \
+            "$(fmt_num "$output")" \
+            "$(fmt_num "$cache")"
+    fi
+
+    # OpenCode
+    if tool_exists "~/.local/share/opencode/opencode.db"; then
+        local db
+        db=$(expand_path "~/.local/share/opencode/opencode.db")
+        local sessions input output cache
+        sessions=$(sqlite3 "$db" "SELECT COUNT(*) FROM session;" 2>/dev/null || echo "0")
+        input=$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_input), 0) FROM session;" 2>/dev/null || echo "0")
+        output=$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_output), 0) FROM session;" 2>/dev/null || echo "0")
+        cache=$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_cache_read), 0) FROM session;" 2>/dev/null || echo "0")
+        printf "  ${COLOR_OPENCODE}${BOLD}◈ %-13s${RESET} %10s %15s %15s %12s\n" \
+            "OpenCode" \
+            "$(fmt_num "$sessions")" \
+            "$(fmt_num "$input")" \
+            "$(fmt_num "$output")" \
+            "$(fmt_num "$cache")"
+    fi
+
+    # Codex CLI
+    if tool_exists "~/.codex/state_5.sqlite"; then
+        local db
+        db=$(expand_path "~/.codex/state_5.sqlite")
+        local sessions tokens
+        sessions=$(sqlite3 "$db" "SELECT COUNT(*) FROM threads;" 2>/dev/null || echo "0")
+        tokens=$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_used), 0) FROM threads;" 2>/dev/null || echo "0")
+        printf "  ${COLOR_CODEX}${BOLD}◇ %-13s${RESET} %10s %15s %15s %12s\n" \
+            "Codex CLI" \
+            "$(fmt_num "$sessions")" \
+            "$(fmt_num "$tokens")" \
+            "N/A" \
+            "N/A"
+    fi
+
+    printf "\n"
+}
+
+# =============================================================================
+# EXPORT FUNCTIONS
+# =============================================================================
+
+export_json() {
+    local output_file="${1:-ai-stats-$(date +%Y%m%d-%H%M%S).json}"
+    local json="{"
+    json="${json}\"generated_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+    json="${json}\"tools\":{"
+
+    local first=true
+
+    # Claude Code
+    if tool_exists "~/.claude/stats-cache.json"; then
+        [[ "$first" == false ]] && json="${json},"
+        first=false
+        local data
+        data=$(cat "$(expand_path "~/.claude/stats-cache.json")")
+        json="${json}\"claude_code\":$data"
+    fi
+
+    # OpenCode
+    if tool_exists "~/.local/share/opencode/opencode.db"; then
+        [[ "$first" == false ]] && json="${json},"
+        first=false
+        local db
+        db=$(expand_path "~/.local/share/opencode/opencode.db")
+        json="${json}\"opencode\":{"
+        json="${json}\"sessions\":$(sqlite3 "$db" "SELECT COUNT(*) FROM session;" 2>/dev/null || echo "0"),"
+        json="${json}\"messages\":$(sqlite3 "$db" "SELECT COUNT(*) FROM message;" 2>/dev/null || echo "0"),"
+        json="${json}\"tokens_input\":$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_input), 0) FROM session;" 2>/dev/null || echo "0"),"
+        json="${json}\"tokens_output\":$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_output), 0) FROM session;" 2>/dev/null || echo "0"),"
+        json="${json}\"tokens_reasoning\":$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_reasoning), 0) FROM session;" 2>/dev/null || echo "0"),"
+        json="${json}\"tokens_cache_read\":$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_cache_read), 0) FROM session;" 2>/dev/null || echo "0"),"
+        json="${json}\"tokens_cache_write\":$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_cache_write), 0) FROM session;" 2>/dev/null || echo "0"),"
+        json="${json}\"total_cost\":$(sqlite3 "$db" "SELECT COALESCE(SUM(cost), 0) FROM session;" 2>/dev/null || echo "0")"
+        json="${json}}"
+    fi
+
+    # Codex CLI
+    if tool_exists "~/.codex/state_5.sqlite"; then
+        [[ "$first" == false ]] && json="${json},"
+        first=false
+        local db
+        db=$(expand_path "~/.codex/state_5.sqlite")
+        json="${json}\"codex\":{"
+        json="${json}\"threads\":$(sqlite3 "$db" "SELECT COUNT(*) FROM threads;" 2>/dev/null || echo "0"),"
+        json="${json}\"active_threads\":$(sqlite3 "$db" "SELECT COUNT(*) FROM threads WHERE archived = 0;" 2>/dev/null || echo "0"),"
+        json="${json}\"archived_threads\":$(sqlite3 "$db" "SELECT COUNT(*) FROM threads WHERE archived = 1;" 2>/dev/null || echo "0"),"
+        json="${json}\"tokens_used\":$(sqlite3 "$db" "SELECT COALESCE(SUM(tokens_used), 0) FROM threads;" 2>/dev/null || echo "0")"
+        json="${json}}"
+    fi
+
+    json="${json}}}"
+
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq '.' > "$output_file"
+    else
+        echo "$json" > "$output_file"
+    fi
+    printf "${SUCCESS}%s${RESET}\n" "Exported to: $output_file"
+}
+
+# =============================================================================
+# HELP & USAGE
+# =============================================================================
+
+show_help() {
+    cat << 'EOF'
+AI Coding Tools Usage Statistics
+
+USAGE:
+    ai-stats.sh [COMMAND] [OPTIONS]
+
+COMMANDS:
+    dashboard, d      Show comprehensive dashboard (default)
+    claude, c         Show Claude Code statistics
+    opencode, o       Show OpenCode statistics
+    codex, x          Show Codex CLI statistics
+    compare, cmp      Show cross-tool comparison
+    export, e         Export data to JSON
+    help, h           Show this help message
+
+OPTIONS:
+    -o, --output FILE   Output file for export command
+    --no-color          Disable colored output
+    --width NUM         Set terminal width manually
+
+EXAMPLES:
+    ai-stats.sh                    # Show dashboard
+    ai-stats.sh claude             # Show Claude Code stats
+    ai-stats.sh export -o stats.json   # Export to JSON
+    ai-stats.sh compare            # Compare all tools
+
+EXTENDING:
+    To add a new tool:
+    1. Add entry to TOOL_NAMES, TOOL_DISPLAYS, TOOL_PATHS, TOOL_TYPES arrays
+    2. Implement {tool_name}_stats and {tool_name}_recent functions
+    3. Add detection in show_dashboard function
+
+SUPPORTED TOOLS:
+    • Claude Code    (~/.claude/stats-cache.json)
+    • OpenCode       (~/.local/share/opencode/opencode.db)
+    • Codex CLI      (~/.codex/state_5.sqlite)
+
+DEPENDENCIES:
+    • sqlite3        (required)
+    • jq             (optional, for JSON processing)
+
+EOF
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    local command="${1:-dashboard}"
+    local output_file=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -o|--output)
+                output_file="$2"
+                shift 2
+                ;;
+            --no-color)
+                # Disable colors
+                RESET=''
+                BOLD=''
+                DIM=''
+                PRIMARY=''
+                SECONDARY=''
+                SUCCESS=''
+                WARNING=''
+                DANGER=''
+                INFO=''
+                MUTED=''
+                HIGHLIGHT=''
+                shift
+                ;;
+            --width)
+                TERM_WIDTH="$2"
+                shift 2
+                ;;
+            -h|--help|help|h)
+                show_help
+                exit 0
+                ;;
+            *)
+                command="$1"
+                shift
+                ;;
+        esac
+    done
+
+    # Check dependencies
+    if ! command -v sqlite3 &>/dev/null; then
+        echo "Error: sqlite3 is required but not installed." >&2
+        exit 1
+    fi
+
+    # Execute command
+    case "$command" in
+        dashboard|d|""|all)
+            show_dashboard
+            show_claude
+            show_opencode
+            show_codex
+            ;;
+        claude|c)
+            show_claude
+            ;;
+        opencode|o)
+            show_opencode
+            ;;
+        codex|x)
+            show_codex
+            ;;
+        compare|cmp)
+            show_comparison
+            ;;
+        export|e)
+            export_json "$output_file"
+            ;;
+        *)
+            echo "Unknown command: $command"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
