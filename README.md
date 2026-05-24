@@ -47,14 +47,24 @@ Only tools with existing data files are shown. Missing tools are silently skippe
 
 | Dependency | Required | Purpose |
 |------------|----------|---------|
-| Bash 3.x+ | Yes | Script runtime (macOS default) |
+| Bash 3.x+ | Yes | Script runtime |
 | `sqlite3` | Yes | Read OpenCode and Codex databases |
-| `jq` | No | JSON parsing for Claude Code (fallback built-in) |
+| `jq` | No | Per-model breakdown, daily activity, and MCP server listing for Claude Code |
 
-Install on macOS with Homebrew:
+Install dependencies:
 
 ```bash
+# macOS
 brew install sqlite jq
+
+# Arch Linux
+sudo pacman -S sqlite jq
+
+# Debian / Ubuntu
+sudo apt install sqlite3 jq
+
+# Fedora / RHEL
+sudo dnf install sqlite jq
 ```
 
 ---
@@ -142,9 +152,9 @@ A summary overview of all detected tools: total sessions, total tokens, and a pr
 - Sessions and message counts
 - Input / output token totals
 - Cache read and write tokens
-- Token breakdown by model
-- Recent 7-day activity (sessions, messages, tool calls per day)
-- MCP servers configured in `claude_desktop_config.json`
+- Token breakdown by model (requires `jq`)
+- Recent 7-day activity: sessions, messages, tool calls per day (requires `jq`)
+- MCP servers configured in `claude_desktop_config.json` (requires `jq`)
 - Installed plugins and skill counts per plugin
 
 ### OpenCode (`opencode`)
@@ -154,7 +164,7 @@ A summary overview of all detected tools: total sessions, total tokens, and a pr
 - Cache read and write tokens
 - Estimated cost
 - Token and session breakdown by model
-- Recent 7-day activity (sessions, tokens, cost per day)
+- Recent 7-day activity: sessions, tokens, cost per day
 - MCP servers and skill paths from `opencode.json`
 
 ### Codex CLI (`codex`)
@@ -163,7 +173,7 @@ A summary overview of all detected tools: total sessions, total tokens, and a pr
 - Total tokens used
 - Source breakdown (CLI vs VS Code)
 - Token breakdown by model
-- Recent 7-day activity (threads, tokens per day)
+- Recent 7-day activity: threads, tokens per day
 - Enabled plugins and MCP servers per plugin
 
 ### Comparison (`compare`)
@@ -194,7 +204,8 @@ The script reads **only local files** — no network requests are made.
 | Tool | File | Notes |
 |------|------|-------|
 | Claude Code stats | `~/.claude/stats-cache.json` | Written by Claude Code automatically |
-| Claude MCP config | `~/Library/Application Support/Claude/claude_desktop_config.json` | macOS only |
+| Claude MCP config | `~/Library/Application Support/Claude/claude_desktop_config.json` | macOS |
+| Claude MCP config | `~/.config/Claude/claude_desktop_config.json` | Linux (XDG) |
 | Claude plugins | `~/.claude/plugins/installed_plugins.json` | Plugin registry |
 | OpenCode database | `~/.local/share/opencode/opencode.db` | SQLite, written by OpenCode |
 | OpenCode config | `~/.config/opencode/opencode.json` | MCP and skills config |
@@ -228,17 +239,21 @@ The script uses a simple registry pattern. To add support for a new tool:
 
 3. **Implement the daily function** — `{tool_name}_daily` for the 7-day activity view.
 
-4. **Add a show function** — `show_mytool` that calls `tool_banner`, then `mytool_stats`, `mytool_daily`.
+4. **Implement the extensions function** — `{tool_name}_extensions` for MCP servers and plugins.
 
-5. **Wire it into `show_dashboard`** and the `main` case statement.
+5. **Add a show function** — `show_mytool` that calls `tool_banner`, then the three functions above.
+
+6. **Wire it into `show_dashboard`** and the `main` case statement.
 
 ---
 
 ## Compatibility
 
-- macOS (primary target, tested on macOS 13+)
-- Linux (supported, requires `jq` for Claude Code JSON parsing on systems without `numfmt`)
+- macOS 13+ (primary target, tested)
+- Linux (fully supported — Arch, Debian, Ubuntu, Fedora, and compatible distros)
 - Bash 3.2+ compatible — no associative arrays, no `mapfile`
+- Number formatting works without `numfmt` via a pure-bash fallback
+- Claude Code JSON is parsed with `grep`/`awk` when `jq` is not installed (session and token totals only; per-model breakdown requires `jq`)
 
 ---
 

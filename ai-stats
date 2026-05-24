@@ -4,7 +4,7 @@
 # Supports: Claude Code, OpenCode, Codex CLI
 # Extensible architecture for adding new tools
 #
-# Compatible with Bash 3.x+ (macOS default)
+# Compatible with Bash 3.x+ on macOS and Linux
 #
 
 set -e
@@ -123,17 +123,22 @@ progress_bar() {
   [[ $empty -gt 0 ]] && printf "${MUTED}%s${RESET}" "$(printf '%*s' "$empty" '' | tr ' ' '░')"
 }
 
-# Format large numbers with commas
+# Format large numbers with commas (portable: numfmt → pure bash)
 fmt_num() {
   local num="$1"
   if [[ "$num" == "null" || -z "$num" ]]; then
     echo "0"
-  elif command -v numfmt &>/dev/null; then
-    echo "$num" | numfmt --grouping 2>/dev/null || echo "$num"
-  else
-    # Manual comma insertion for systems without numfmt
-    printf "%'d\n" "$num" 2>/dev/null || echo "$num"
+    return
   fi
+  if command -v numfmt &>/dev/null; then
+    numfmt --grouping 2>/dev/null <<< "$num" && return
+  fi
+  local s="$num" result=""
+  while [[ ${#s} -gt 3 ]]; do
+    result=",${s: -3}${result}"
+    s="${s:0:$((${#s} - 3))}"
+  done
+  echo "${s}${result}"
 }
 
 # Format bytes to human readable
@@ -190,12 +195,26 @@ expand_path() {
   fi
 }
 
-# Check if tool data exists
+# Check if tool data file exists
 tool_exists() {
   local path="$1"
   local full_path
   full_path=$(expand_path "$path")
   [[ -f "$full_path" ]]
+}
+
+# Minimal JSON helpers used when jq is unavailable
+_json_int() {
+  # Extract first top-level integer value for a key
+  local key="$1" json="$2"
+  echo "$json" | grep -o "\"${key}\":[[:space:]]*[0-9]*" | head -1 | grep -o '[0-9]*$'
+}
+
+_json_sum() {
+  # Sum all numeric values for a field name anywhere in the JSON blob
+  local key="$1" json="$2"
+  echo "$json" | grep -o "\"${key}\":[[:space:]]*[0-9]*" | grep -o '[0-9]*$' \
+    | awk '{s+=$1} END {print (s>0)?s:0}'
 }
 
 # =============================================================================
@@ -215,17 +234,24 @@ claude_stats() {
   local data
   data=$(cat "$path")
 
-  # Extract key metrics
+  # Extract key metrics (prefer jq; fall back to grep+awk)
   local total_sessions total_messages
-  total_sessions=$(echo "$data" | jq -r '.totalSessions // 0' 2>/dev/null || echo "0")
-  total_messages=$(echo "$data" | jq -r '.totalMessages // 0' 2>/dev/null || echo "0")
-
-  # Calculate total tokens from modelUsage
   local total_input total_output total_cache_read total_cache_write
-  total_input=$(echo "$data" | jq -r '[.modelUsage[]?.inputTokens // 0] | add' 2>/dev/null || echo "0")
-  total_output=$(echo "$data" | jq -r '[.modelUsage[]?.outputTokens // 0] | add' 2>/dev/null || echo "0")
-  total_cache_read=$(echo "$data" | jq -r '[.modelUsage[]?.cacheReadInputTokens // 0] | add' 2>/dev/null || echo "0")
-  total_cache_write=$(echo "$data" | jq -r '[.modelUsage[]?.cacheCreationInputTokens // 0] | add' 2>/dev/null || echo "0")
+  if command -v jq &>/dev/null; then
+    total_sessions=$(echo "$data" | jq -r '.totalSessions // 0' 2>/dev/null || echo "0")
+    total_messages=$(echo "$data" | jq -r '.totalMessages // 0' 2>/dev/null || echo "0")
+    total_input=$(echo "$data" | jq -r '[.modelUsage[]?.inputTokens // 0] | add' 2>/dev/null || echo "0")
+    total_output=$(echo "$data" | jq -r '[.modelUsage[]?.outputTokens // 0] | add' 2>/dev/null || echo "0")
+    total_cache_read=$(echo "$data" | jq -r '[.modelUsage[]?.cacheReadInputTokens // 0] | add' 2>/dev/null || echo "0")
+    total_cache_write=$(echo "$data" | jq -r '[.modelUsage[]?.cacheCreationInputTokens // 0] | add' 2>/dev/null || echo "0")
+  else
+    total_sessions=$(_json_int "totalSessions" "$data")
+    total_messages=$(_json_int "totalMessages" "$data")
+    total_input=$(_json_sum "inputTokens" "$data")
+    total_output=$(_json_sum "outputTokens" "$data")
+    total_cache_read=$(_json_sum "cacheReadInputTokens" "$data")
+    total_cache_write=$(_json_sum "cacheCreationInputTokens" "$data")
+  fi
 
   local total_tokens=$((total_input + total_output))
 
@@ -262,31 +288,46 @@ claude_stats() {
   printf "\n"
   printf "${MUTED}%s${RESET}\n" "  ── Model Breakdown ─────────────────────────────────"
   printf "  ${MUTED}%-30s %15s${RESET}\n" "Model" "Tokens"
-  echo "$data" | jq -r '.modelUsage | to_entries | sort_by(.value.inputTokens + .value.outputTokens) | reverse | .[] |
-        "\(.key)\t\(.value.inputTokens + .value.outputTokens)"' 2>/dev/null | while IFS=$'\t' read -r model tokens; do
-    printf "  ${INFO}%-30s${RESET} ${HIGHLIGHT}%15s${RESET} ${MUTED}tokens${RESET}\n" "$model" "$(fmt_num "$tokens")"
-  done
+  if command -v jq &>/dev/null; then
+    echo "$data" | jq -r '.modelUsage | to_entries | sort_by(.value.inputTokens + .value.outputTokens) | reverse | .[] |
+          "\(.key)\t\(.value.inputTokens + .value.outputTokens)"' 2>/dev/null | while IFS=$'\t' read -r model tokens; do
+      printf "  ${INFO}%-30s${RESET} ${HIGHLIGHT}%15s${RESET} ${MUTED}tokens${RESET}\n" "$model" "$(fmt_num "$tokens")"
+    done
+  else
+    printf "  ${MUTED}%s${RESET}\n" "(install jq for per-model breakdown)"
+  fi
 
   return 0
 }
 
 # MCP servers and skills stats for Claude Code
 claude_extensions() {
-  # MCP servers from desktop config
-  local mcp_config="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+  # MCP config location differs by OS:
+  #   macOS: ~/Library/Application Support/Claude/
+  #   Linux: $XDG_CONFIG_HOME/Claude/  (defaults to ~/.config/Claude/)
+  local mcp_config
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    mcp_config="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+  else
+    mcp_config="${XDG_CONFIG_HOME:-$HOME/.config}/Claude/claude_desktop_config.json"
+  fi
   local mcp_count=0
 
   printf "\n"
   printf "${MUTED}%s${RESET}\n" "  ── MCP Servers ─────────────────────────────────────"
 
-  if [[ -f "$mcp_config" ]] && command -v jq &>/dev/null; then
-    mcp_count=$(jq -r '.mcpServers | length' "$mcp_config" 2>/dev/null || echo "0")
-    printf "  "
-    printf "%-20s" "$(printc "$MUTED" "Configured:")"
-    printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$mcp_count")"
-    jq -r '.mcpServers | keys | .[]' "$mcp_config" 2>/dev/null | while read -r name; do
-      printf "  ${MUTED}  •${RESET} ${INFO}%s${RESET}\n" "$name"
-    done
+  if [[ -f "$mcp_config" ]]; then
+    if command -v jq &>/dev/null; then
+      mcp_count=$(jq -r '.mcpServers | length' "$mcp_config" 2>/dev/null || echo "0")
+      printf "  "
+      printf "%-20s" "$(printc "$MUTED" "Configured:")"
+      printf " %s\n" "$(printc "$HIGHLIGHT$BOLD" "$mcp_count")"
+      jq -r '.mcpServers | keys | .[]' "$mcp_config" 2>/dev/null | while read -r name; do
+        printf "  ${MUTED}  •${RESET} ${INFO}%s${RESET}\n" "$name"
+      done
+    else
+      printf "  ${MUTED}%s${RESET}\n" "install jq to list MCP servers"
+    fi
   else
     printf "  ${MUTED}%s${RESET}\n" "No MCP config found"
   fi
@@ -350,12 +391,16 @@ claude_daily() {
   printf "\n"
   printf "${MUTED}%s${RESET}\n" "  ── Recent 7 Days ───────────────────────────────────"
   printf "  ${MUTED}%-12s %10s %10s %10s${RESET}\n" "Date" "Sessions" "Messages" "Tools"
-  echo "$data" | jq -r '.dailyActivity | sort_by(.date) | reverse | .[0:7] | .[] |
-        "\(.date)\t\(.sessionCount)\t\(.messageCount)\t\(.toolCallCount)"' 2>/dev/null |
-    while IFS=$'\t' read -r date sessions messages tools; do
-      printf "  ${INFO}%-12s${RESET} ${BOLD}%10s${RESET} %10s ${SUCCESS}%10s${RESET}\n" \
-        "$date" "$sessions" "$messages" "$tools"
-    done
+  if command -v jq &>/dev/null; then
+    echo "$data" | jq -r '.dailyActivity | sort_by(.date) | reverse | .[0:7] | .[] |
+          "\(.date)\t\(.sessionCount)\t\(.messageCount)\t\(.toolCallCount)"' 2>/dev/null |
+      while IFS=$'\t' read -r date sessions messages tools; do
+        printf "  ${INFO}%-12s${RESET} ${BOLD}%10s${RESET} %10s ${SUCCESS}%10s${RESET}\n" \
+          "$date" "$sessions" "$messages" "$tools"
+      done
+  else
+    printf "  ${MUTED}%s${RESET}\n" "(install jq for daily activity breakdown)"
+  fi
 }
 
 # =============================================================================
@@ -541,7 +586,7 @@ codex_stats() {
   local total_tokens
   total_tokens=$(sqlite3 "$db_path" "SELECT COALESCE(SUM(tokens_used), 0) FROM threads;" 2>/dev/null || echo "0")
 
-  # Query source and provider breakdown
+  # Query source breakdown
   local cli_count vscode_count
   cli_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM threads WHERE source = 'cli';" 2>/dev/null || echo "0")
   vscode_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM threads WHERE source = 'vscode';" 2>/dev/null || echo "0")
@@ -627,6 +672,11 @@ codex_extensions() {
     return
   fi
 
+  if ! command -v jq &>/dev/null; then
+    printf "  ${MUTED}%s${RESET}\n" "install jq to list MCP servers"
+    return
+  fi
+
   local enabled_plugins
   enabled_plugins=$(awk '/^\[plugins\./ { gsub(/^\[plugins\."/, ""); gsub(/"\].*/, ""); plugin=$0 } /^enabled = true/ { print plugin }' "$config" 2>/dev/null)
 
@@ -703,18 +753,25 @@ show_dashboard() {
   local claude_tokens=0 opencode_tokens=0 codex_tokens=0
   local has_data=false
 
-  # Collect data
+  # Collect Claude Code data
   if tool_exists "~/.claude/stats-cache.json"; then
     local data
     data=$(cat "$(expand_path "~/.claude/stats-cache.json")")
-    claude_sessions=$(echo "$data" | jq -r '.totalSessions // 0' 2>/dev/null || echo "0")
     local claude_input claude_output
-    claude_input=$(echo "$data" | jq -r '[.modelUsage[]?.inputTokens // 0] | add' 2>/dev/null || echo "0")
-    claude_output=$(echo "$data" | jq -r '[.modelUsage[]?.outputTokens // 0] | add' 2>/dev/null || echo "0")
+    if command -v jq &>/dev/null; then
+      claude_sessions=$(echo "$data" | jq -r '.totalSessions // 0' 2>/dev/null || echo "0")
+      claude_input=$(echo "$data" | jq -r '[.modelUsage[]?.inputTokens // 0] | add' 2>/dev/null || echo "0")
+      claude_output=$(echo "$data" | jq -r '[.modelUsage[]?.outputTokens // 0] | add' 2>/dev/null || echo "0")
+    else
+      claude_sessions=$(_json_int "totalSessions" "$data")
+      claude_input=$(_json_sum "inputTokens" "$data")
+      claude_output=$(_json_sum "outputTokens" "$data")
+    fi
     claude_tokens=$((claude_input + claude_output))
     has_data=true
   fi
 
+  # Collect OpenCode data
   if tool_exists "~/.local/share/opencode/opencode.db"; then
     local db
     db=$(expand_path "~/.local/share/opencode/opencode.db")
@@ -723,6 +780,7 @@ show_dashboard() {
     has_data=true
   fi
 
+  # Collect Codex data
   if tool_exists "~/.codex/state_5.sqlite"; then
     local db
     db=$(expand_path "~/.codex/state_5.sqlite")
@@ -839,10 +897,17 @@ show_comparison() {
     local data
     data=$(cat "$(expand_path "~/.claude/stats-cache.json")")
     local sessions input output cache
-    sessions=$(echo "$data" | jq -r '.totalSessions // 0' 2>/dev/null || echo "0")
-    input=$(echo "$data" | jq -r '[.modelUsage[]?.inputTokens // 0] | add' 2>/dev/null || echo "0")
-    output=$(echo "$data" | jq -r '[.modelUsage[]?.outputTokens // 0] | add' 2>/dev/null || echo "0")
-    cache=$(echo "$data" | jq -r '[.modelUsage[]?.cacheReadInputTokens // 0] | add' 2>/dev/null || echo "0")
+    if command -v jq &>/dev/null; then
+      sessions=$(echo "$data" | jq -r '.totalSessions // 0' 2>/dev/null || echo "0")
+      input=$(echo "$data" | jq -r '[.modelUsage[]?.inputTokens // 0] | add' 2>/dev/null || echo "0")
+      output=$(echo "$data" | jq -r '[.modelUsage[]?.outputTokens // 0] | add' 2>/dev/null || echo "0")
+      cache=$(echo "$data" | jq -r '[.modelUsage[]?.cacheReadInputTokens // 0] | add' 2>/dev/null || echo "0")
+    else
+      sessions=$(_json_int "totalSessions" "$data")
+      input=$(_json_sum "inputTokens" "$data")
+      output=$(_json_sum "outputTokens" "$data")
+      cache=$(_json_sum "cacheReadInputTokens" "$data")
+    fi
     printf "  ${COLOR_CLAUDE}${BOLD}◆ %-13s${RESET} %10s %15s %15s %12s\n" \
       "Claude Code" \
       "$(fmt_num "$sessions")" \
@@ -958,7 +1023,7 @@ show_help() {
 AI Coding Tools Usage Statistics
 
 USAGE:
-    ai-stats.sh [COMMAND] [OPTIONS]
+    ai-stats [COMMAND] [OPTIONS]
 
 COMMANDS:
     dashboard, d      Show comprehensive dashboard (default)
@@ -975,16 +1040,17 @@ OPTIONS:
     --width NUM         Set terminal width manually
 
 EXAMPLES:
-    ai-stats.sh                    # Show dashboard
-    ai-stats.sh claude             # Show Claude Code stats
-    ai-stats.sh export -o stats.json   # Export to JSON
-    ai-stats.sh compare            # Compare all tools
+    ai-stats                       # Show dashboard
+    ai-stats claude                # Show Claude Code stats
+    ai-stats export -o stats.json  # Export to JSON
+    ai-stats compare               # Compare all tools
 
 EXTENDING:
     To add a new tool:
     1. Add entry to TOOL_NAMES, TOOL_DISPLAYS, TOOL_PATHS, TOOL_TYPES arrays
-    2. Implement {tool_name}_stats and {tool_name}_recent functions
-    3. Add detection in show_dashboard function
+    2. Implement {tool_name}_stats, {tool_name}_daily, {tool_name}_extensions
+    3. Add show_{tool_name} calling tool_banner then the three functions above
+    4. Wire show_{tool_name} into show_dashboard and the main case statement
 
 SUPPORTED TOOLS:
     • Claude Code    (~/.claude/stats-cache.json)
@@ -993,7 +1059,8 @@ SUPPORTED TOOLS:
 
 DEPENDENCIES:
     • sqlite3        (required)
-    • jq             (optional, for JSON processing)
+    • jq             (optional — enables per-model breakdown, daily activity,
+                      and MCP server listing for Claude Code)
 
 EOF
 }
@@ -1014,10 +1081,11 @@ main() {
       shift 2
       ;;
     --no-color)
-      # Disable colors
       RESET=''
       BOLD=''
       DIM=''
+      ITALIC=''
+      UNDERLINE=''
       PRIMARY=''
       SECONDARY=''
       SUCCESS=''
@@ -1026,6 +1094,9 @@ main() {
       INFO=''
       MUTED=''
       HIGHLIGHT=''
+      COLOR_CLAUDE=''
+      COLOR_OPENCODE=''
+      COLOR_CODEX=''
       shift
       ;;
     --width)
@@ -1046,6 +1117,10 @@ main() {
   # Check dependencies
   if ! command -v sqlite3 &>/dev/null; then
     echo "Error: sqlite3 is required but not installed." >&2
+    echo "  macOS:  brew install sqlite" >&2
+    echo "  Arch:   sudo pacman -S sqlite" >&2
+    echo "  Debian: sudo apt install sqlite3" >&2
+    echo "  Fedora: sudo dnf install sqlite" >&2
     exit 1
   fi
 

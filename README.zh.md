@@ -47,14 +47,24 @@
 
 | 依赖 | 是否必须 | 用途 |
 |------|----------|------|
-| Bash 3.x+ | 是 | 脚本运行时（macOS 默认） |
+| Bash 3.x+ | 是 | 脚本运行时 |
 | `sqlite3` | 是 | 读取 OpenCode 和 Codex 数据库 |
-| `jq` | 否 | 解析 Claude Code 的 JSON（有内置回退方案） |
+| `jq` | 否 | Claude Code 的按模型明细、日活数据和 MCP 服务器列表 |
 
-macOS 使用 Homebrew 安装：
+安装依赖：
 
 ```bash
+# macOS
 brew install sqlite jq
+
+# Arch Linux
+sudo pacman -S sqlite jq
+
+# Debian / Ubuntu
+sudo apt install sqlite3 jq
+
+# Fedora / RHEL
+sudo dnf install sqlite jq
 ```
 
 ---
@@ -142,9 +152,9 @@ ai-stats --no-color claude | tee claude-stats.txt
 - 会话数与消息数
 - 输入 / 输出 Token 总量
 - 缓存读取与写入 Token
-- 按模型分组的 Token 明细
-- 近 7 天活动（每日会话数、消息数、工具调用次数）
-- `claude_desktop_config.json` 中配置的 MCP 服务器
+- 按模型分组的 Token 明细（需要 `jq`）
+- 近 7 天活动：每日会话数、消息数、工具调用次数（需要 `jq`）
+- `claude_desktop_config.json` 中配置的 MCP 服务器（需要 `jq`）
 - 已安装插件及每个插件的 Skill 数量
 
 ### OpenCode（`opencode`）
@@ -154,7 +164,7 @@ ai-stats --no-color claude | tee claude-stats.txt
 - 缓存读取与写入 Token
 - 费用估算
 - 按模型分组的 Token 和会话明细
-- 近 7 天活动（每日会话数、Token 数、费用）
+- 近 7 天活动：每日会话数、Token 数、费用
 - `opencode.json` 中配置的 MCP 服务器与 Skill 路径
 
 ### Codex CLI（`codex`）
@@ -163,7 +173,7 @@ ai-stats --no-color claude | tee claude-stats.txt
 - 总 Token 用量
 - 来源分布（CLI vs VS Code）
 - 按模型分组的 Token 明细
-- 近 7 天活动（每日线程数、Token 数）
+- 近 7 天活动：每日线程数、Token 数
 - 已启用插件及每个插件的 MCP 服务器
 
 ### 横向对比（`compare`）
@@ -194,7 +204,8 @@ ai-stats --no-color claude | tee claude-stats.txt
 | 工具 | 文件路径 | 备注 |
 |------|----------|------|
 | Claude Code 统计 | `~/.claude/stats-cache.json` | 由 Claude Code 自动写入 |
-| Claude MCP 配置 | `~/Library/Application Support/Claude/claude_desktop_config.json` | 仅 macOS |
+| Claude MCP 配置 | `~/Library/Application Support/Claude/claude_desktop_config.json` | macOS |
+| Claude MCP 配置 | `~/.config/Claude/claude_desktop_config.json` | Linux（XDG） |
 | Claude 插件列表 | `~/.claude/plugins/installed_plugins.json` | 插件注册表 |
 | OpenCode 数据库 | `~/.local/share/opencode/opencode.db` | SQLite，由 OpenCode 写入 |
 | OpenCode 配置 | `~/.config/opencode/opencode.json` | MCP 与 Skill 配置 |
@@ -228,17 +239,21 @@ ai-stats --no-color claude | tee claude-stats.txt
 
 3. **实现日活函数** — `{tool_name}_daily` 用于近 7 天活动视图。
 
-4. **实现展示函数** — `show_mytool` 调用 `tool_banner`，再依次调用 `mytool_stats`、`mytool_daily`。
+4. **实现扩展函数** — `{tool_name}_extensions` 用于展示 MCP 服务器和插件信息。
 
-5. **接入主流程** — 在 `show_dashboard` 和 `main` 的 `case` 语句中添加对应分支。
+5. **实现展示函数** — `show_mytool` 调用 `tool_banner`，再依次调用以上三个函数。
+
+6. **接入主流程** — 在 `show_dashboard` 和 `main` 的 `case` 语句中添加对应分支。
 
 ---
 
 ## 兼容性
 
-- macOS（主要目标平台，已在 macOS 13+ 上测试）
-- Linux（支持，在缺少 `numfmt` 的系统上需要安装 `jq` 来解析 Claude Code JSON）
+- macOS 13+（主要目标平台，已测试）
+- Linux（完整支持 — Arch、Debian、Ubuntu、Fedora 及同类发行版）
 - 兼容 Bash 3.2+ — 未使用关联数组或 `mapfile`
+- 数字格式化有纯 bash 回退方案，不依赖 `numfmt`
+- 未安装 `jq` 时，Claude Code JSON 通过 `grep`/`awk` 解析（仅会话数和 Token 总量；按模型明细需要 `jq`）
 
 ---
 
